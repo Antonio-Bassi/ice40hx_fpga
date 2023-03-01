@@ -7,27 +7,35 @@
  */
 
 module __pullup_io__ (input in, output out);
-
 wire din, dout, trien;
-
 assign out = din;
-
 SB_IO #(.PIN_TYPE(6'b1010_01), .PULLUP(1'b1)) io_ctl(.PACKAGE_PIN(in), .OUTPUT_ENABLE(trien), .D_OUT_0(dout), .D_IN_0(din));
-
 endmodule
 
-module __psc__ #(parameter cntr_width = 2)(input clk_in, output clk_out);
-  reg [cntr_width-1:0] cntr;
-  assign clk_out = cntr[cntr_width-1];
-  always @(posedge clk_in)
-  begin
-    cntr <= cntr + 1;
-  end
+module __psc__ 
+  (
+    input       ref_clk,
+    input       rstb,
+    input       bypass,
+    input       ext_fb,
+    input [7:0] d_delay,
+    input       latch_in_val,
+    
+    output      lock,
+    output      pll_out_global,
+    output      pll_out_core
+  );
+  
+  SB_PLL40_CORE #(
+    .FEEDBACK_PATH("SIMPLE"),
+    .PLL_SELECT("GENCLK"),
+    .DIVR(4'b0000),
+    .DIVF(4'b1100),
+    .DIVQ()  
+    .FILTER_RANGE()
+  ) pll ()
+
 endmodule  
-
-module __mux__ (input sel, input din_0, input din_1, output dout);
-  assign dout = (~sel & din_0) | (sel & din_1);
-endmodule
 
 /* 
  *  SPI mode truth table.
@@ -41,63 +49,84 @@ endmodule
  */
 module ice_spi_masterif
   (
-    input         iclk,   // internal clock (FPGA clock @ 12 MHz)
-    input         rst,    // reset
-    input         txen,   // Transmission enable
-    input   [1:0] mode,   // SPI mode
-    input         miso,   // Master input - slave output
-    output        mosi,   // Master output - slave input
-    output        sclk,   // Slave Clock
-    output        ss      // Slave select
+    // Control signals
+    input       i_spi_rst,    // reset SPI interface core logic.
+    input       i_spi_clk,    // SPI clock signal.
+    input       i_spi_txen,   // SPI transmission enable.
+    input       i_spi_load,   // Load SPI instruction into data register.
+    input       i_spi_instr,  // SPI instruction.
+    input [1:0] i_spi_mode,   // SPI mode signal.
+
+    // SPI interface signals
+    input         i_spi_data_in   // SPI data input.
+    output        o_spi_cs,       // SPI chip select signal, a.k.a slave select.
+    output        o_spi_sclk,     // SPI chip clock, a.k.a slave clock.
+    output        o_spi_data_out  // SPI data outout.
   );
 
-// internal logic 
+  /* State machine codification */
+  localparam IDLE = 2'b00; // Interface is idle.
+  localparam TSXN = 2'b01; // Transaction is being processed.
+  localparam CSD  = 2'b10; // Chip select is inactive.
 
-/* SPI interface signals */
-reg [7:0] imosi = 0;
-reg [7:0] imiso = 0;
+  /* parameters */
+  localparam SPI_BITS_PER_BYTE = 8;
+  localparam SPI_TX_CNT = 4;
 
-/* Clock phase and control signals */
-reg [3:0] bit_cntr = 0;
+  /* Internal signals and registers */
+  reg _spi_tx_dv;                       // SPI transmission data is valid.
+  reg [SPI_TX_CNT-1:0]  _spi_tx_cntr;   // SPI transmission bit counter.
+  reg [1:0]             _spi_state;     // SPI state register.
+  reg [SPI_BITS_PER_BYTE-1:0] _spi_miso // SPI Master Input Slave Output data register.
+  reg [SPI_BITS_PER_BYTE-1:0] _spi_mosi // SPI Master Output Slave Input data register.
 
+  always @(posedge i_spi_clk or negedge i_spi_rst) begin
+    if(~i_spi_rst) begin
+      _spi_state      <= 0'b00;
+      _spi_tx_dv      <= 1'b0;
+      _spi_miso       <= 8'h00;
+      _spi_mosi       <= 8'h00;
+      o_spi_sclk      <= i_spi_mode[0];
+      o_spi_cs        <= 1'b1;
+      o_spi_data_out  <= 1'b0;
+    end // if(~i_spi_rst)
 
-// wires and buses
-wire pullup_rst_out, pullup_txen_out;
-wire psc_clk_out;
-wire psc_clk_out;
-wire CPOL = mode[0];
-wire CPHA = mode[1];
+    else if(~i_spi_load) begin
+      _spi_mosi <= i_spi_instr;
+      _spi_tx_dv <= 1'b1;
+    end // if(~i_spi_load)
 
-// module instances
-__psc__#(.cntr_width(11)) psc(.clk_in(iclk), .clk_out(psc_clk_out));    // Clock prescaler
-__mux__ cpol_mux()
-__pullup_io__ pullup_txen(.in(txen), .out(pullup_txen));                // Pull-up stage for txen pin.
-__pullup_io__ pullup_rst(.in(rst), .out(pullup_rst_out));               // Pull-up stage for rst pin. 
+    else if(~i_spi_txen) begin
+      case (_spi_state)
+        IDLE:
+        begin
+          if(_spi_tx_dv) begin
 
-assign imiso = miso;
-assign mosi  = imosi;
-assign sclk  = (~ss) & (psc_clk_out); // Clock is only supplied when slave select is pulled down.
+            o_spi_cs <= 1'b0;
+            _spi_state <= TSXN;
+            
+          end // if(_spi_tx_dv)
+        end
 
-// Synchronous reset logic
-always @(posedge psc_clk_out) begin
-  if(~pullup_rst_out) begin
-      ss      <= 1;
-      imode   <= 8'h00;
-      imosi   <= 8'h00;
-      imiso   <= 8'h00;
-      sclk    <= 0;
-  end // if(~pullup_rst_out)
-end
+        TSXN:
+        begin
+          
+        end
 
-always @(posedge iclk) begin
-  if(~pullup_txen_out) begin
-    
+        CSD:
+        begin
+          
+        end
 
+        default:
+        begin
+          _spi_tx_dv  <= 1'b0;
+          _spi_state  <= IDLE;
+          o_spi_cs    <= 1'b1;    
+        end
+      endcase  
+    end //if(~i_spi_txen)
 
-    
-  end // if(~pullup_txen_out)
-end
+  end // always @(posedge i_spi_clk or negedge i_spi_rst)
 
-
-end// if(~pullup_txen_out)
 endmodule
